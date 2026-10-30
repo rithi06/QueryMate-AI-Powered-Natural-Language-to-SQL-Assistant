@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NL → SQL Assistant</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#f7f8fa; --card:#fff; --text:#1c2230; --muted:#6b7385; --accent:#3b5bdb; --border:#e3e6ec; --code:#0f172a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12151c; --card:#1b1f29; --text:#e8eaf0; --muted:#9aa3b5; --accent:#7b93ff; --border:#2c3240; --code:#0b0e14; }
+  }
+  * { box-sizing:border-box }
+  body { margin:0; font:15px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--text) }
+  main { max-width:960px; margin:0 auto; padding:24px 16px 60px }
+  h1 { font-size:22px; margin:0 0 4px } .sub { color:var(--muted); margin:0 0 20px }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; margin-bottom:16px }
+  .row { display:flex; gap:8px } input { flex:1; padding:10px 12px; font-size:15px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--text) }
+  button { padding:10px 18px; border:0; border-radius:8px; background:var(--accent); color:#fff; font-size:15px; cursor:pointer }
+  button:disabled { opacity:.6; cursor:wait }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:12px }
+  .chip { background:transparent; color:var(--accent); border:1px solid var(--border); padding:4px 10px; font-size:13px; border-radius:99px }
+  pre { background:var(--code); color:#e6edf3; padding:12px; border-radius:8px; overflow-x:auto; margin:8px 0 0; font-size:13px }
+  .label { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted) }
+  .err { color:#e03131 } .tablewrap { overflow-x:auto; margin-top:8px }
+  table { border-collapse:collapse; width:100%; font-size:14px } th,td { text-align:left; padding:6px 10px; border-bottom:1px solid var(--border); white-space:nowrap }
+  th { color:var(--muted); font-weight:600 } canvas { max-height:320px; margin-top:12px }
+  .hist div { cursor:pointer; padding:4px 0; color:var(--muted) } .hist div:hover { color:var(--accent) }
+</style>
+</head>
+<body>
+<main>
+  <h1>Ask your data</h1>
+  <p class="sub">Natural language → SQL → results. Read-only access to a retail sales database.</p>
+
+  <div class="card">
+    <div class="row">
+      <input id="q" placeholder="e.g. Top 5 product categories by revenue in 2025" autofocus>
+      <button id="go">Ask</button>
+    </div>
+    <div class="chips" id="examples"></div>
+  </div>
+
+  <div id="out"></div>
+  <div class="card hist" id="histCard" hidden><div class="label">Recent questions</div><div id="hist"></div></div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const examples = [
+  "What is the total revenue by year?",
+  "Top 5 product categories by revenue",
+  "Which region has the highest profit?",
+  "Monthly revenue trend in 2025",
+  "Top 10 customers by number of orders",
+  "Average discount by category"
+];
+let chart;
+
+examples.forEach(t => {
+  const b = document.createElement("button"); b.className = "chip"; b.textContent = t;
+  b.onclick = () => { $("q").value = t; ask(); }; $("examples").appendChild(b);
+});
+
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function card(...kids) { const c = el("div", "card"); c.append(...kids); return c; }
+
+async function ask() {
+  const question = $("q").value.trim(); if (!question) return;
+  $("go").disabled = true; $("go").textContent = "Thinking…";
+  const out = $("out"); out.replaceChildren();
+  try {
+    const res = await fetch("/api/ask", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({question}) });
+    render(await res.json());
+  } catch (e) { out.append(card(el("div", "err", "Request failed: " + e))); }
+  $("go").disabled = false; $("go").textContent = "Ask"; loadHistory();
+}
+
+function render(r) {
+  const out = $("out");
+  if (r.explanation) out.append(card(el("div", "label", "What this does"), el("div", null, r.explanation)));
+  if (r.sql) out.append(card(el("div", "label", "Generated SQL" + (r.attempts > 1 ? " (auto-corrected)" : "")), el("pre", null, r.sql)));
+  if (!r.ok) { out.append(card(el("div", "err", r.error || "Something went wrong."))); return; }
+
+  const wrap = el("div", "tablewrap"), t = el("table"), head = el("tr");
+  r.columns.forEach(c => head.append(el("th", null, c))); t.append(head);
+  r.rows.forEach(row => { const tr = el("tr"); row.forEach(v => tr.append(el("td", null, v === null ? "—" : v))); t.append(tr); });
+  wrap.append(t);
+  const res = card(el("div", "label", `Results (${r.rows.length}${r.truncated ? "+, truncated" : ""} rows)`), wrap);
+
+  // Chart when the result is [label, number] with a modest number of rows
+  const numeric = r.columns.length === 2 && r.rows.length > 1 && r.rows.length <= 40 && r.rows.every(x => typeof x[1] === "number");
+  if (numeric) {
+    const cv = el("canvas"); res.append(cv);
+    if (chart) chart.destroy();
+    setTimeout(() => { chart = new Chart(cv, { type: /month|date|year|day/i.test(r.columns[0]) ? "line" : "bar",
+      data: { labels: r.rows.map(x => x[0]), datasets: [{ label: r.columns[1], data: r.rows.map(x => x[1]), borderColor:"#3b5bdb", backgroundColor:"#3b5bdb99" }] },
+      options: { plugins: { legend: { display: false } } } }); });
+  }
+  out.append(res);
+}
+
+async function loadHistory() {
+  const h = await (await fetch("/api/history")).json();
+  $("histCard").hidden = !h.length; $("hist").replaceChildren();
+  h.forEach(x => { const d = el("div", null, (x.ok ? "✓ " : "✗ ") + x.question); d.onclick = () => { $("q").value = x.question; }; $("hist").append(d); });
+}
+
+$("go").onclick = ask; $("q").addEventListener("keydown", e => { if (e.key === "Enter") ask(); });
+loadHistory();
+</script>
+</body>
+</html>

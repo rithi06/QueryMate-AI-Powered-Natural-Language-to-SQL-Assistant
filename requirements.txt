@@ -1,0 +1,6 @@
+flask>=3.0
+google-genai
+sqlglot>=25.0
+gunicorn
+python-dotenv
+flask-limiter
